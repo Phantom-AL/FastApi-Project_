@@ -1,0 +1,28 @@
+# Python bytecode
+*.pyc
+*.pyo
+__pycache__/
+
+# Виртуальные окружения
+venv/
+env/
+ENV/
+.venv/
+.venv.*
+
+# PyCharm
+.idea/
+
+# Тестовые файлы
+*.log
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Сгенерированные файлы базы данных (например, SQLite)
+*.sqlite
+*.db
+
+# Файлы переменных окружения
+.env
