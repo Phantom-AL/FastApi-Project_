@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import engine, AsyncSessionLocal
 from app.models import Base, Credits, Payments, Plans, Dictionary
 from pydantic import BaseModel
+import asyncio
 
 
 app = FastAPI()
@@ -88,7 +89,7 @@ async def get_user_credits(db: DbSession, user_id: int):
 
 # Вставка планов из загружаемого файла
 @app.post('/plans_insert')
-async def plans_insert(db: DbSession, file: UploadFile = File(...)):
+async def plans_insert(db: DbSession, file: UploadFile):
     """
     Метод для загрузки планов на новый месяц
     """
@@ -149,37 +150,43 @@ async def plans_insert(db: DbSession, file: UploadFile = File(...)):
 
 
 @app.get('/plans_performance')
-async def plans_performance(db: DbSession, check_date: date = Query(...)):
+async def plans_performance(db: DbSession, check_date: date):
     """
     Метод для получения информации о выполнении планов на определенную дату
     """
     result = []
     first_day_of_month = check_date.replace(day=1)
 
-    response = select(Plans).where(Plans.period == first_day_of_month)
-    result_exec = await db.execute(response)
-    plans = result_exec.scalars().all()
+    # Получаем все категории из словаря
+    response = await db.execute(select(Dictionary.id, Dictionary.name))
+    category_map = dict(response.all())  # {id: name}
 
+    # Получаем планы на месяц
+    response = await db.execute(select(Plans).where(Plans.period == first_day_of_month))
+    plans = response.scalars().all()
+
+    # Основная логика
     for plan in plans:
-        if plan.category_id == 3:
-            response = select(func.sum(Credits.body)).where(
-                Credits.issuance_date >= first_day_of_month,
-                Credits.issuance_date <= check_date
+        category_name = category_map.get(plan.category_id, "Неизвестно")
+        actual_sum = 0
+
+        if category_name == "Выдача кредитов":
+            response = await db.execute(
+                select(func.sum(Credits.body)).where(
+                    Credits.issuance_date.between(first_day_of_month, check_date)
+                )
             )
-        elif plan.category_id == 4:
-            response = select(func.sum(Payments.sum)).where(
-                Payments.payment_date >= first_day_of_month,
-                Payments.payment_date <= check_date
+            actual_sum = response.scalar() or 0
+
+        elif category_name == "Сбор платежей":
+            response = await db.execute(
+                select(func.sum(Payments.sum)).where(
+                    Payments.payment_date.between(first_day_of_month, check_date)
+                )
             )
+            actual_sum = response.scalar() or 0
 
-        result_exec = await db.execute(response)
-        actual_sum = result_exec.scalar() or 0
-
-        response = select(Dictionary.name).where(Dictionary.id == plan.category_id)
-        result_exec = await db.execute(response)
-        category_name = result_exec.scalar()
-
-        percent = float(actual_sum) / float(plan.sum) * 100 if plan.sum > 0 else 0
+        percent = (actual_sum / plan.sum * 100) if plan.sum else 0
 
         result.append({
             "month": plan.period.month,
@@ -192,6 +199,17 @@ async def plans_performance(db: DbSession, check_date: date = Query(...)):
     return result
 
 
+def init_month_data():
+    return {
+        'issuance_count': 0,
+        'issuance_sum': 0,
+        'plan_issuance_sum': 0,
+        'plan_gather_sum': 0,
+        'payment_count': 0,
+        'payment_sum': 0
+    }
+
+
 async def get_records_by_year(db: DbSession, model, year: int, date_column: str):
     # Получаем столбец с датой из модели
     column = getattr(model, date_column)
@@ -202,25 +220,25 @@ async def get_records_by_year(db: DbSession, model, year: int, date_column: str)
     return result_exec.scalars().all()
 
 
+def calculate_percent(numerator, denominator):
+    return round((numerator / denominator * 100), 2) if denominator else 0
+
+
 @app.get('/year_performance')
-async def year_performance(db: DbSession, year: int = Query(...)):
+async def year_performance(db: DbSession, year: int):
     """
     Метод получения сводной информации за заданный год. Группировка по-месячная
     """
     result = []
 
-    plans = await get_records_by_year(db, Plans, year, 'period')
-    credits = await get_records_by_year(db, Credits, year, 'issuance_date')
-    payments = await get_records_by_year(db, Payments, year, 'payment_date')
+    # Получаем все записи
+    plans, credits, payments = await asyncio.gather(
+        get_records_by_year(db, Plans, year, 'period'),
+        get_records_by_year(db, Credits, year, 'issuance_date'),
+        get_records_by_year(db, Payments, year, 'payment_date'),
+    )
 
-    monthly_data = defaultdict(lambda: {
-        'issuance_count': 0,
-        'issuance_sum': 0,
-        'plan_issuance_sum': 0,
-        'plan_gather_sum': 0,
-        'payment_count': 0,
-        'payment_sum': 0
-    })
+    monthly_data = defaultdict(init_month_data)
 
     # Подсчет данных по кредитам
     for credit in credits:
@@ -243,37 +261,30 @@ async def year_performance(db: DbSession, year: int = Query(...)):
         data['payment_sum'] += payment.sum
 
     # Общая сумма по всем кредитам за весь год
-    total_issuance_sum = sum(data['issuance_sum'] for data in monthly_data.values())
+    total_issuance_sum = 0
 
     # Общая сумма по всем платежам за весь год
-    total_payment_sum = sum(data['payment_sum'] for data in monthly_data.values())
+    total_payment_sum = 0
 
-    for month, data in monthly_data.items():
-        # Процент выполнения плана по выданным кредитам за месяц
-        percent_issuance = (data['issuance_sum'] / data['plan_issuance_sum'] * 100) if data['plan_issuance_sum'] else 0
+    for data in monthly_data.values():
+        total_issuance_sum += data['issuance_sum']
+        total_payment_sum += data['payment_sum']
 
-        # Процент выполнения плана по собранным платежам за месяц
-        percent_gather = (data['payment_sum'] / data['plan_gather_sum'] * 100) if data['plan_gather_sum'] else 0
-
-        # Процент выданных кредитов за месяц относительно общей суммы выданных кредитов за год
-        percent_issuance_of_year = (data['issuance_sum'] / total_issuance_sum * 100) if total_issuance_sum else 0
-
-        # Процент собранных платежей за месяц относительно общей суммы собранных платежей за год
-        percent_payment_of_year = (data['payment_sum'] / total_payment_sum * 100) if total_payment_sum else 0
-
+    # Формирование финального результата
+    for month, data in sorted(monthly_data.items()):
         result.append({
             'month': month,
             'year': year,
             'issuances_count': data['issuance_count'],
             'issuance_sum': data['issuance_sum'],
             'plan_issuance_sum': data['plan_issuance_sum'],
-            'percent_issuance': round(percent_issuance, 2),
+            'percent_issuance': calculate_percent(data['issuance_sum'], data['plan_issuance_sum']),
             'payments_count': data['payment_count'],
             'payment_sum': data['payment_sum'],
             'plan_gather_sum': data['plan_gather_sum'],
-            'percent_gather': round(percent_gather, 2),
-            'percent_issuance_of_year': round(percent_issuance_of_year, 2),
-            'percent_payment_of_year': round(percent_payment_of_year, 2)
+            'percent_gather': calculate_percent(data['payment_sum'], data['plan_gather_sum']),
+            'percent_issuance_of_year': calculate_percent(data['issuance_sum'], total_issuance_sum),
+            'percent_payment_of_year': calculate_percent(data['payment_sum'], total_payment_sum),
         })
 
     return result
